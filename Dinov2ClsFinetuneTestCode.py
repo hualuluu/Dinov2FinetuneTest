@@ -91,7 +91,10 @@ class GetClsDatasets(Dataset):
         return imageTensor, torch.tensor(cls_id)
         
 """
-用于读取分类数据集的数据内容
+用于读取分类数据集的数据内容：
+1. 使用torch自带的transform
+2. 使用opencv读数据
+没有做过多的数据增强，因为代码是为了做微调参数，此处不是重点
 """
 def getDinov2ClsDatasets(dataDir, dataFlag = "transform", imageSize = 518,
                           batchSize = 64, mean = PIXEL_MEANS, std = PIXEL_STDS):
@@ -135,7 +138,12 @@ def getDinov2ClsDatasets(dataDir, dataFlag = "transform", imageSize = 518,
         return trainLoader , valLoader
 
 
-# 构建模型
+"""
+构建Dinov2 为Backbone的分类网络
+这里的分类头很简单就是两个全连接层，
+没做更多的测试，代码只是为测试Dinov2可以微调，以及微调方式是否正确
+classNum： 分类类别
+"""
 class Dinov2ClsModel(nn.Module):
     def __init__(self, dinov2Vits14Model, classNum):
         super().__init__()
@@ -150,11 +158,11 @@ class Dinov2ClsModel(nn.Module):
         features = self.transformer.forward_features(x)
         # 提取 [CLS] token 特征（归一化后的）
         cls_token = features['x_norm_clstoken']  # 形状: [B, hidden_dim]
-        x = self.classifier(cls_token)
+        x = self.classifier(cls_token) # 分类头
         return x
     
 
-# 比较模型参数
+# 比较模型参数，用于确认参数训练时，是否有效冻结
 def compare_state_dicts(state_dict1, state_dict2, threshold=1e-6):
     """
     比较两个 state_dict，输出参数发生变化的层及变化幅度。
@@ -197,7 +205,15 @@ def compare_state_dicts(state_dict1, state_dict2, threshold=1e-6):
     return changed_layers
 
 
-# 为了保证loacal模式 和hub模式下一样可以支持任意输入尺寸图像
+"""
+adapt_position_encoding： 用于对位置编码进行插值，来支持不同的输入图像尺寸
+
+原因：
+官方提供的pretrain Model的参数，仅支持518*518的输入尺寸
+如果本地读取不为518*518的图像时就会报错了，但是官方的torch.hub.load的模型能支持不同维度的输入图像尺寸
+根本原因是 Dinov2对应的位置编码 pos_embed 的形状是 [1, num_patches+1, dim] = [1, 1370, 384]
+可以知道官方的读取代码有自适应的方式
+"""
 def adapt_position_encoding(model, new_img_size=518, patch_size=14):
     """
     调整 DINOv2 模型的位置编码以适配新的输入尺寸。
@@ -260,6 +276,10 @@ def adapt_position_encoding(model, new_img_size=518, patch_size=14):
 
 
 # modelFlag = "local" / "hub"
+"""
+getDinov2Vits14Model 获得dinov2 backbone的网络结构
+这里为了方便测试，用modelFlag选择使用本地加载还是hub下载，来测试两种加载模式的效果
+"""
 def getDinov2Vits14Model(modelFlag = "local", imageSize = 224, patchSize = 14):
 
     vit_model= None
@@ -292,7 +312,7 @@ def getDinov2Vits14Model(modelFlag = "local", imageSize = 224, patchSize = 14):
 
 
 
-# 测试流程
+# 简单的分类测试流程，用于测试模型的精度
 def test(valLoader, modelpath, class_names = []):
     
     
@@ -332,7 +352,11 @@ def test(valLoader, modelpath, class_names = []):
     show_confusion_matrix(df_cm)
 
 
-# 训练流程
+"""
+训练流程 测试包含多种情况
+vitLoad = "local"/ "hub" -> 用于指定加载backbone的方式 "本地" / "线上"
+freeze = False / True -> 用于指定是否冻结backbone的参数，如果为True则表示只训练分类头，固定Backbone的参数
+"""
 def train(trainLoader, modelpath,  epoch = 150, imageSize = 224, patchSize = 14,
           numClass = 6, vitLoad = "local", freeze = False):
 
@@ -397,20 +421,26 @@ def train(trainLoader, modelpath,  epoch = 150, imageSize = 224, patchSize = 14,
         
 
 if __name__ == "__main__":
-
-    BatchSize = 32
+    """
+    基础参数设置
+    """
+    BatchSize = 32 
     epoch = 2
-    imageSize = 224
-    patchSize = 14
-    numClass = 5
-    class_names = ['calss_0', 'calss_1', 'calss_2', 'calss_3', 'calss_4']#['calss_0', 'calss_1', 'calss_2', 'calss_3', 'calss_4', 'calss_5']
-    modelpath = "best.pth"
-    vitLoad = "local"
-    freeze = True
-    dataTrans = "myself" # transform myself
-    dataDir = "/home/hualulu/code/dinov2/data/battery/"
-    
+    imageSize = 224 # 输入图像的尺寸
+    patchSize = 14  # transformer 的patch尺寸
+    numClass = 5    # 分类的类别数
+    # 分类的类别名称： 这里简单用class_id表示
+    class_names = ['calss_0', 'calss_1', 'calss_2', 'calss_3', 'calss_4', 'calss_5']
+    modelpath = "best.pth" # 训练好的模型参数保存地址
+    vitLoad = "local" #backbone的加载方式
+    freeze = True     # 是否冻结backbone参数
+    dataTrans = "myself" # transform myself 确认加载参数的方式 是否使用opencv
+    dataDir = "/home/hualulu/code/dinov2/data/" # 训练数据集的地址
+
+    # 1. 加载图像数据，获得训练和验证的数据loader
     trainLoader, valLoader = getDinov2ClsDatasets(dataDir, dataTrans, imageSize, BatchSize, PIXEL_MEANS, PIXEL_STDS)
+    # 2. 训练模型，获得模型参数
     train(trainLoader, modelpath,  epoch, imageSize, patchSize, numClass, vitLoad, freeze)
+    # 3. 测试训练好的模型精度
     test(valLoader, modelpath, class_names)
     
