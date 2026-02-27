@@ -45,6 +45,8 @@
 
 ## 分类OnnxModel转换： 
 官方dinov2 的环境为torch2.0.0,转换过程中会报错，这是因为torch本身的bug，查询git后发现后面的torch版本已经修复了，所以更新一下环境参数
+报错信息如下：   
+Exporting the operator 'aten::scaled_dot_product_attention' to ONNX opset version 17 is not supported.   
 
 ```shell   
 pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 xformers --index-url https://download.pytorch.org/whl/cu118   
