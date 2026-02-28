@@ -5,8 +5,12 @@ test 2: 参考代码 - 微调 backbone + cls , 加载采用 本地的model param
 test 3: 参考代码 - 仅训练分类头 cls 冻结backbone, 加载采用 torch.hub.load 
 test 4: 参考代码 - 仅训练分类头 cls 冻结backbone, 加载采用 本地的model param 
 
-为了后续 转C++ 测试中可以采用 Opencv 加载图像
+为了后续 转C++ 先采用 Opencv 加载图像
 包括：数据加载， 分类头， 测试代码
+
+getDinov2Vits14Model 中vit_model的构造方式修改了一下，不采用vits.__dict__定义
+因为vits.__dict__中指定了MemEffAttention结构，这个结构涉及到 xformers版本问题 导致 转onnx 有问题
+我自己的代码是由cuda要求的，所以采用基础的DinoVisionTransformer加载网络结构，指定的是Attention结构
 """
 
 # 1. 导入并忽略所有警告（可选）
@@ -25,7 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets,  transforms
-from dinov2.models import vision_transformer as vits
+from dinov2.models.vision_transformer import DinoVisionTransformer
 import torch.optim as optim
 import pandas as pd
 import seaborn as sns
@@ -33,7 +37,6 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import numpy as np
 
-# 方便复现测试
 # 为 CPU 设置随机种子
 torch.manual_seed(42)
 # 为当前 GPU 设置种子
@@ -90,12 +93,7 @@ class GetClsDatasets(Dataset):
 
         return imageTensor, torch.tensor(cls_id)
         
-"""
-用于读取分类数据集的数据内容：
-1. 使用torch自带的transform
-2. 使用opencv读数据
-没有做过多的数据增强，因为代码是为了做微调参数，此处不是重点
-"""
+
 def getDinov2ClsDatasets(dataDir, dataFlag = "transform", imageSize = 518,
                           batchSize = 64, mean = PIXEL_MEANS, std = PIXEL_STDS):
     if dataFlag == "transform":
@@ -138,12 +136,7 @@ def getDinov2ClsDatasets(dataDir, dataFlag = "transform", imageSize = 518,
         return trainLoader , valLoader
 
 
-"""
-构建Dinov2 为Backbone的分类网络
-这里的分类头很简单就是两个全连接层，
-没做更多的测试，代码只是为测试Dinov2可以微调，以及微调方式是否正确
-classNum： 分类类别
-"""
+# 构建模型
 class Dinov2ClsModel(nn.Module):
     def __init__(self, dinov2Vits14Model, classNum):
         super().__init__()
@@ -158,11 +151,11 @@ class Dinov2ClsModel(nn.Module):
         features = self.transformer.forward_features(x)
         # 提取 [CLS] token 特征（归一化后的）
         cls_token = features['x_norm_clstoken']  # 形状: [B, hidden_dim]
-        x = self.classifier(cls_token) # 分类头
+        x = self.classifier(cls_token)
         return x
     
 
-# 比较模型参数，用于确认参数训练时，是否有效冻结
+# 比较模型参数
 def compare_state_dicts(state_dict1, state_dict2, threshold=1e-6):
     """
     比较两个 state_dict，输出参数发生变化的层及变化幅度。
@@ -205,15 +198,7 @@ def compare_state_dicts(state_dict1, state_dict2, threshold=1e-6):
     return changed_layers
 
 
-"""
-adapt_position_encoding： 用于对位置编码进行插值，来支持不同的输入图像尺寸
-
-原因：
-官方提供的pretrain Model的参数，仅支持518*518的输入尺寸
-如果本地读取不为518*518的图像时就会报错了，但是官方的torch.hub.load的模型能支持不同维度的输入图像尺寸
-根本原因是 Dinov2对应的位置编码 pos_embed 的形状是 [1, num_patches+1, dim] = [1, 1370, 384]
-可以知道官方的读取代码有自适应的方式
-"""
+# 为了保证loacal模式 和hub模式下一样可以支持任意输入尺寸图像
 def adapt_position_encoding(model, new_img_size=518, patch_size=14):
     """
     调整 DINOv2 模型的位置编码以适配新的输入尺寸。
@@ -276,22 +261,41 @@ def adapt_position_encoding(model, new_img_size=518, patch_size=14):
 
 
 # modelFlag = "local" / "hub"
-"""
-getDinov2Vits14Model 获得dinov2 backbone的网络结构
-这里为了方便测试，用modelFlag选择使用本地加载还是hub下载，来测试两种加载模式的效果
-"""
-def getDinov2Vits14Model(modelFlag = "local", imageSize = 224, patchSize = 14):
+def getDinov2Vits14Model(modelFlag = "local", imageSize = 224, patchSize = 14,model_size = "vits14"):
 
     vit_model= None
     if(modelFlag == "local"):
         
         # vit_model = vits.vit_small(img_size = imageSize, patch_size=patchSize)
+        """
         vit_model = vits.__dict__['vit_small'](
             img_size=518,#imageSize,
             patch_size=patchSize,
             num_register_tokens=0,          # 官方模型有4个寄存器
             init_values=1e-5,                # LayerScale初始值
             block_chunks=0,                   # 0表示不分组
+        )
+        """
+        model_map = {
+            "vits14": ("vit_small", 384),
+            "vitb14": ("vit_base", 768), 
+            "vitl14": ("vit_large", 1024),
+            "vitg14": ("vit_giant2", 1536)
+        }
+    
+        arch_name, embed_dim = model_map[model_size]
+
+    
+        vit_model = DinoVisionTransformer(
+            img_size = 518,
+            patch_size=14,
+            embed_dim=embed_dim,
+            depth=12 if "small" in arch_name else 12 if "base" in arch_name else 24,
+            num_heads=6 if "small" in arch_name else 12 if "base" in arch_name else 16,
+            mlp_ratio=4,
+            num_register_tokens=0,
+            init_values=1e-5,
+            block_chunks=0                   # 0表示不分组
         )
         state_dict = torch.load("dinov2_vits14_pretrain.pth", map_location='cpu')
         # 直接加载，使用 strict=False 查看缺失/多余键
@@ -312,7 +316,7 @@ def getDinov2Vits14Model(modelFlag = "local", imageSize = 224, patchSize = 14):
 
 
 
-# 简单的分类测试流程，用于测试模型的精度
+# 测试流程
 def test(valLoader, modelpath, class_names = []):
     
     
@@ -352,11 +356,7 @@ def test(valLoader, modelpath, class_names = []):
     show_confusion_matrix(df_cm)
 
 
-"""
-训练流程 测试包含多种情况
-vitLoad = "local"/ "hub" -> 用于指定加载backbone的方式 "本地" / "线上"
-freeze = False / True -> 用于指定是否冻结backbone的参数，如果为True则表示只训练分类头，固定Backbone的参数
-"""
+# 训练流程
 def train(trainLoader, modelpath,  epoch = 150, imageSize = 224, patchSize = 14,
           numClass = 6, vitLoad = "local", freeze = False):
 
@@ -420,27 +420,56 @@ def train(trainLoader, modelpath,  epoch = 150, imageSize = 224, patchSize = 14,
         prev_params = current_params
         
 
-if __name__ == "__main__":
-    """
-    基础参数设置
-    """
-    BatchSize = 32 
-    epoch = 2
-    imageSize = 224 # 输入图像的尺寸
-    patchSize = 14  # transformer 的patch尺寸
-    numClass = 5    # 分类的类别数
-    # 分类的类别名称： 这里简单用class_id表示
-    class_names = ['calss_0', 'calss_1', 'calss_2', 'calss_3', 'calss_4', 'calss_5']
-    modelpath = "best.pth" # 训练好的模型参数保存地址
-    vitLoad = "local" #backbone的加载方式
-    freeze = True     # 是否冻结backbone参数
-    dataTrans = "myself" # transform myself 确认加载参数的方式 是否使用opencv
-    dataDir = "/home/hualulu/code/dinov2/data/" # 训练数据集的地址
 
-    # 1. 加载图像数据，获得训练和验证的数据loader
+def predict(imagepath, modelpath, inputSizeW, inputSizeH, patchSize):
+    
+    modelDinov2Cls = torch.load(modelpath).to(device)
+    modelDinov2Cls.eval()
+    
+    with torch.no_grad():
+        image = cv2.imread(imagepath)
+        imageRGB = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # 先试试简单的 resize 
+        image = cv2.resize(imageRGB, (inputSizeW, inputSizeH), interpolation=cv2.INTER_LINEAR)
+        
+        # 4. 转换为 float32 并缩放到 [0, 1]（等效 ToTensor）
+        img_float = image.astype(np.float32) / 255.0
+
+        # 5. 归一化 (Normalize)
+        # 将 mean 和 std 转换为 numpy 数组并 reshape 以适配广播
+        mean_arr = np.array(PIXEL_MEANS, dtype=np.float32).reshape(1, 1, 3)
+        std_arr = np.array(PIXEL_STDS, dtype=np.float32).reshape(1, 1, 3)
+        img_norm = (img_float - mean_arr) / std_arr
+
+        # 6. 将 HWC 转换为 CHW（PyTorch 张量格式）
+        img_chw = np.transpose(img_norm, (2, 0, 1))
+        imageTensor = torch.from_numpy(img_chw).unsqueeze(dim=0).to(device)
+
+        preds = modelDinov2Cls(imageTensor)
+        predictions = preds.argmax(dim=1, keepdim=True).squeeze()
+
+        print(preds)
+
+if __name__ == "__main__":
+
+    BatchSize = 32
+    epoch = 2
+    imageSize = 224
+    patchSize = 14
+    numClass = 5
+    class_names = ['calss_0', 'calss_1', 'calss_2', 'calss_3', 'calss_4']#['calss_0', 'calss_1', 'calss_2', 'calss_3', 'calss_4', 'calss_5']
+    modelpath = "best_cls_finetune.pth"
+    vitLoad = "local"
+    freeze = True
+    dataTrans = "myself" # transform myself
+    dataDir = "/home/hualulu/code/dinov2/data/battery/"
+    
     trainLoader, valLoader = getDinov2ClsDatasets(dataDir, dataTrans, imageSize, BatchSize, PIXEL_MEANS, PIXEL_STDS)
-    # 2. 训练模型，获得模型参数
     train(trainLoader, modelpath,  epoch, imageSize, patchSize, numClass, vitLoad, freeze)
-    # 3. 测试训练好的模型精度
     test(valLoader, modelpath, class_names)
+
+    
+    #imagepath ="/home/hualulu/code/dinov2/data/battery/val/calss_4/image_7334_06.jpg"
+    #predict(imagepath, modelpath, imageSize, imageSize, patchSize)
     
